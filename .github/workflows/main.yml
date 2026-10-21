@@ -1,0 +1,114 @@
+name: Build Bus Driver APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android project and add our code
+        run: |
+          flutter create --platforms=android --project-name bus_driver --org com.example build_app
+          cp pubspec.yaml build_app/pubspec.yaml
+          rm -rf build_app/lib build_app/test
+          cp -r lib build_app/lib
+
+      - name: Patch Android manifest and add native helper
+        run: |
+          python3 - << 'PY'
+          import re
+          p = 'build_app/android/app/src/main/AndroidManifest.xml'
+          s = open(p).read()
+
+          # Let the app see whether Google Play Services is installed
+          pkg = '<package android:name="com.google.android.gms"/>'
+          if '<queries>' in s:
+              s = s.replace('<queries>', '<queries>\n        ' + pkg, 1)
+          else:
+              s = s.replace('<application', '<queries>\n        ' + pkg + '\n    </queries>\n    <application', 1)
+
+          lines = [
+              '<uses-permission android:name="android.permission.INTERNET"/>',
+              '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>',
+              '<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>',
+              '<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>',
+              '<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>',
+              '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>',
+              '<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>',
+              '<uses-permission android:name="android.permission.WAKE_LOCK"/>',
+              '<uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>',
+              '<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>',
+              '<uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation"/>',
+              '<uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>',
+              '<uses-feature android:name="android.hardware.bluetooth_le" android:required="false"/>',
+          ]
+          block = ''.join('    %s\n' % l for l in lines)
+          s = s.replace('<application', block + '    <application', 1)
+
+          s = re.sub(r'android:label="[^"]*"', 'android:label="Bus Driver"', s, count=1)
+          open(p, 'w').write(s)
+          PY
+
+          MAIN=$(find build_app/android/app/src/main -name MainActivity.kt | head -n 1)
+          PKG=$(grep -m1 '^package' "$MAIN" | sed 's/package //')
+          cat > "$MAIN" << KOTLIN
+          package $PKG
+
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : FlutterActivity() {
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "bus_driver/env")
+                      .setMethodCallHandler { call, result ->
+                          when (call.method) {
+                              "hasGooglePlayServices" -> result.success(hasGms())
+                              "moveToBack" -> {
+                                  moveTaskToBack(true)
+                                  result.success(null)
+                              }
+                              else -> result.notImplemented()
+                          }
+                      }
+              }
+
+              private fun hasGms(): Boolean {
+                  return try {
+                      packageManager.getApplicationInfo("com.google.android.gms", 0).enabled
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+          }
+          KOTLIN
+
+          cat "$MAIN"
+          cat build_app/android/app/src/main/AndroidManifest.xml
+
+      - name: Build APK (arm64, arm32 and x86_64 in one file)
+        working-directory: build_app
+        run: |
+          flutter pub get
+          flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bus-driver-apk
+          path: build_app/build/app/outputs/flutter-apk/app-release.apk
